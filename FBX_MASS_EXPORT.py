@@ -1,7 +1,7 @@
 bl_info = {
     "name": "FBX Mass Export mesh",
     "author": "L1ra",
-    "version": (0, 5, 5),
+    "version": (0, 7, 1),
     "blender": (4, 3, 2),
     "location": "File > Export > FBX > Batch Export",
     "description": "Adds batch export to the native FBX export dialog",
@@ -15,7 +15,7 @@ import re
 import sys
 import subprocess
 from mathutils import Vector
-from bpy.props import BoolProperty, EnumProperty
+from bpy.props import BoolProperty, EnumProperty, StringProperty
 from bpy.types import Operator, Panel, PropertyGroup
 
 
@@ -33,129 +33,138 @@ def TokenizeName(name):
 
 
 
-def BuildGroupFingerprints(tokens):
-    word_indices = [i for i, t in enumerate(tokens) if not t[0].isdigit()]
-    fingerprints = []
-    for skip_idx in word_indices:
-        fp = []
-        for i, t in enumerate(tokens):
-            if i == skip_idx:
-                fp.append("*")
-            elif t[0].isdigit():
-                fp.append(("N", t))
-            else:
-                fp.append(("W", t.lower()))
-        fingerprints.append((tuple(fp), skip_idx))
-    return fingerprints
+def WordSkipMatch(tokensA, tokensB):
+    if len(tokensA) != len(tokensB):
+        return False
+    diffs = [i for i, (a, b) in enumerate(zip(tokensA, tokensB)) if a.lower() != b.lower()]
+    if len(diffs) != 1:
+        return False
+    idx = diffs[0]
+    return not tokensA[idx][0].isdigit()
+
+
+
+def NumericPrefixMatch(tokensA, tokensB):
+    if len(tokensA) == len(tokensB):
+        return False
+    shorter, longer = (tokensA, tokensB) if len(tokensA) < len(tokensB) else (tokensB, tokensA)
+    if not shorter or not longer:
+        return False
+    for i, t in enumerate(shorter):
+        if t.lower() != longer[i].lower():
+            return False
+    for t in longer[len(shorter):]:
+        if not t[0].isdigit():
+            return False
+    return True
+
+
+
+def NamesMatch(tokensA, tokensB):
+    if tokensA == tokensB:
+        return True
+    if WordSkipMatch(tokensA, tokensB):
+        return True
+    if NumericPrefixMatch(tokensA, tokensB):
+        return True
+    return False
+
+
+
+def AutoAnchorFrom(objs):
+    return min(objs, key=lambda o: (len(TokenizeName(o.name)), o.name))
+
+
+
+def GetEffectiveAnchor(objs, attr_name):
+    active = [o for o in objs if not o.fbxBatchExclude]
+    if not active:
+        active = list(objs)
+    if not active:
+        return None
+    for o in active:
+        if getattr(o, attr_name, False):
+            return o
+    return AutoAnchorFrom(active)
+
+
+
+def _OriginAnchorUpdate(self, context):
+    if not getattr(self, "fbxBatchOriginAnchor", False):
+        return
+    scene = getattr(context, "scene", None)
+    if scene is None:
+        return
+    try:
+        this_tokens = TokenizeName(self.name)
+    except Exception:
+        return
+    for obj in scene.objects:
+        if obj is self or obj.type != "MESH":
+            continue
+        if getattr(obj, "fbxBatchOriginAnchor", False):
+            try:
+                if NamesMatch(this_tokens, TokenizeName(obj.name)):
+                    obj.fbxBatchOriginAnchor = False
+            except Exception:
+                pass
+
+
+
+def _NameAnchorUpdate(self, context):
+    if not getattr(self, "fbxBatchNameAnchor", False):
+        return
+    scene = getattr(context, "scene", None)
+    if scene is None:
+        return
+    try:
+        this_tokens = TokenizeName(self.name)
+    except Exception:
+        return
+    for obj in scene.objects:
+        if obj is self or obj.type != "MESH":
+            continue
+        if getattr(obj, "fbxBatchNameAnchor", False):
+            try:
+                if NamesMatch(this_tokens, TokenizeName(obj.name)):
+                    obj.fbxBatchNameAnchor = False
+            except Exception:
+                pass
 
 
 
 def GroupByNameSimilarity(objects):
     if not objects:
-        return {}
+        return []
 
-    token_map = {}
+    tokenMap = {obj: TokenizeName(obj.name) for obj in objects}
+    parent = {id(obj): id(obj) for obj in objects}
+
+    def Find(x):
+        root = x
+        while parent[root] != root:
+            root = parent[root]
+        while parent[x] != root:
+            parent[x], x = root, parent[x]
+        return root
+
+    def Union(a, b):
+        ra, rb = Find(a), Find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    objs = list(objects)
+    n = len(objs)
+    for i in range(n):
+        for j in range(i + 1, n):
+            if NamesMatch(tokenMap[objs[i]], tokenMap[objs[j]]):
+                Union(id(objs[i]), id(objs[j]))
+
+    groupsByRoot = {}
     for obj in objects:
-        tokens = TokenizeName(obj.name)
-        token_map[obj] = tokens
+        groupsByRoot.setdefault(Find(id(obj)), []).append(obj)
 
-    fingerprint_buckets = {}
-
-    for obj, tokens in token_map.items():
-        fps = BuildGroupFingerprints(tokens)
-        for fp, skip_idx in fps:
-            if fp not in fingerprint_buckets:
-                fingerprint_buckets[fp] = []
-            fingerprint_buckets[fp].append((obj, skip_idx))
-
-    used = set()
-    raw_groups = []
-
-    sorted_buckets = sorted(fingerprint_buckets.items(), key=lambda x: -len(x[1]))
-
-    for fp, bucket_items in sorted_buckets:
-        group_objs = []
-        skip_positions = set()
-        for obj, skip_idx in bucket_items:
-            if id(obj) not in used:
-                group_objs.append(obj)
-                skip_positions.add(skip_idx)
-
-        if len(group_objs) >= 2:
-            for obj in group_objs:
-                used.add(id(obj))
-            raw_groups.append((group_objs, skip_positions))
-
-    for obj in objects:
-        if id(obj) not in used:
-            used.add(id(obj))
-            raw_groups.append(([obj], set()))
-
-    result = {}
-    for group_objs, skip_positions in raw_groups:
-        names = [o.name for o in group_objs]
-        fbx_name = DeriveFbxName(names, skip_positions, token_map)
-        if fbx_name in result:
-            fbx_name = fbx_name + "_" + str(len(result))
-        result[fbx_name] = group_objs
-
-    return result
-
-
-
-def DeriveFbxName(names, skip_positions, token_map=None):
-    if len(names) == 1:
-        return names[0]
-
-    if token_map:
-        first_obj = None
-        for obj, tokens in token_map.items():
-            if obj.name == names[0]:
-                first_obj = obj
-                break
-        if first_obj:
-            tokens = token_map[first_obj]
-            result_parts = []
-            for i, t in enumerate(tokens):
-                if i not in skip_positions:
-                    result_parts.append(t)
-            if result_parts:
-                return "_".join(result_parts)
-
-    return BuildFbxNameFallback(names)
-
-
-
-def BuildFbxNameFallback(names):
-    token_lists = [TokenizeName(n) for n in names]
-    if not token_lists:
-        return names[0] if names else "unnamed"
-
-    min_len = min(len(tl) for tl in token_lists)
-
-    prefix_tokens = []
-    for i in range(min_len):
-        vals = set(tl[i].lower() for tl in token_lists)
-        if len(vals) == 1:
-            prefix_tokens.append(token_lists[0][i])
-        else:
-            break
-
-    suffix_tokens = []
-    for i in range(1, min_len - len(prefix_tokens) + 1):
-        vals = set(tl[-i].lower() for tl in token_lists)
-        if len(vals) == 1:
-            suffix_tokens.insert(0, token_lists[0][-i])
-        else:
-            break
-
-    parts = []
-    if prefix_tokens:
-        parts.extend(prefix_tokens)
-    if suffix_tokens:
-        parts.extend(suffix_tokens)
-
-    return "_".join(parts) if parts else names[0]
+    return list(groupsByRoot.values())
 
 
 
@@ -165,25 +174,39 @@ def CollectExportGroups(context, props, useSelection=False):
     else:
         pool = [o for o in context.scene.objects if o.type == "MESH"]
 
-    pool = [o for o in pool if not o.fbxBatchExclude]
-
     groups = []
 
     if props.groupByName:
-        name_groups = GroupByNameSimilarity(pool)
-        for fbx_name, objs in name_groups.items():
-            col_name = GetMeshCollectionName(objs[0]) if props.useCollectionFolders else None
-            key_obj = objs[0]
-            groups.append((fbx_name, col_name, objs, key_obj))
+        solo = [o for o in pool if o.fbxBatchSolo]
+        groupable = [o for o in pool if not o.fbxBatchSolo]
+
+        name_groups = GroupByNameSimilarity(groupable)
+        used_names = {}
+        for objs in name_groups:
+            name_anchor = GetEffectiveAnchor(objs, "fbxBatchNameAnchor")
+            origin_anchor = GetEffectiveAnchor(objs, "fbxBatchOriginAnchor")
+            if name_anchor is None or origin_anchor is None:
+                continue
+            base = name_anchor.name
+            if base in used_names:
+                used_names[base] += 1
+                fbx_name = f"{base}_{used_names[base]}"
+            else:
+                used_names[base] = 0
+                fbx_name = base
+            col_name = GetMeshCollectionName(name_anchor) if props.useCollectionFolders else None
+            groups.append((fbx_name, col_name, objs, origin_anchor))
+
+        for obj in solo:
+            col_name = GetMeshCollectionName(obj) if props.useCollectionFolders else None
+            groups.append((obj.name, col_name, [obj], obj))
 
     elif props.groupByParent:
         parent_map = {}
         standalone = []
         for obj in pool:
             if obj.parent and obj.parent.type == "MESH":
-                if obj.parent not in parent_map:
-                    parent_map[obj.parent] = []
-                parent_map[obj.parent].append(obj)
+                parent_map.setdefault(obj.parent, []).append(obj)
             else:
                 standalone.append(obj)
 
@@ -249,6 +272,36 @@ class FbxBatchProps(PropertyGroup):
         ],
         default="ORIGIN",
     )
+
+
+
+class FBXBATCH_OT_toggleGroupExclude(Operator):
+    bl_idname = "fbxbatch.toggle_group_exclude"
+    bl_label = "Toggle Group Exclude"
+    bl_options = {"INTERNAL"}
+
+    anchor_name: StringProperty()
+
+    def execute(self, context):
+        anchor = context.scene.objects.get(self.anchor_name)
+        if anchor is None or anchor.type != "MESH":
+            return {"CANCELLED"}
+
+        tokens = TokenizeName(anchor.name)
+        group = [
+            o for o in context.scene.objects
+            if o.type == "MESH"
+            and not o.fbxBatchSolo
+            and NamesMatch(tokens, TokenizeName(o.name))
+        ]
+        if not group:
+            return {"CANCELLED"}
+
+        all_excluded = all(o.fbxBatchExclude for o in group)
+        new_val = not all_excluded
+        for o in group:
+            o.fbxBatchExclude = new_val
+        return {"FINISHED"}
 
 
 
@@ -361,8 +414,6 @@ class MeshFbxBatchExporter:
 
 
     def MoveGroupToOrigin(self, objects, key_obj):
-        """Move objects so the anchor ends up at world origin (0,0,0).
-        Pure transform math — no operators, no 3D view context needed."""
         all_objs = list(objects)
         if key_obj not in all_objs:
             all_objs.append(key_obj)
@@ -382,15 +433,12 @@ class MeshFbxBatchExporter:
             anchor_obj = self.ComputeAnchorObject(objects, key_obj)
             offset = Vector((0.0, 0.0, 0.0)) - anchor_obj.matrix_world.translation
 
-        # Apply offset only to root objects within the group;
-        # children will follow their parent automatically.
         for obj in all_objs:
             parent_in_group = obj.parent is not None and obj.parent in all_objs
             if parent_in_group:
                 continue
 
             if obj.parent is not None:
-                # Convert world-space offset into parent-local space
                 parent_matrix = obj.parent.matrix_world
                 try:
                     local_offset = parent_matrix.inverted().to_3x3() @ offset
@@ -460,7 +508,17 @@ class MeshFbxBatchExporter:
 
 
     def Run(self):
-        groups = CollectExportGroups(self.context, self.props, self.fbxOp.use_selection)
+        raw_groups = CollectExportGroups(self.context, self.props, self.fbxOp.use_selection)
+
+        groups = []
+        for name, col_name, objects, key_obj in raw_groups:
+            active = [o for o in objects if not o.fbxBatchExclude]
+            if not active:
+                continue
+            if key_obj is None or key_obj.fbxBatchExclude or key_obj not in objects:
+                key_obj = active[0]
+            groups.append((name, col_name, active, key_obj))
+
         if not groups:
             return groups, False
 
@@ -568,7 +626,10 @@ class FILE_PT_fbxBatch(Panel):
 
                 if props.groupByName:
                     for fbx_name, col_name, objs, key_obj in groups:
-                        self.DrawNameGroupRow(preview_col, fbx_name, objs, props)
+                        if len(objs) >= 2:
+                            self.DrawNameGroupHeader(preview_col, fbx_name, objs)
+                        for obj in objs:
+                            self.DrawNameGroupChild(preview_col, obj, objs, indent=(len(objs) >= 2))
                 elif props.groupByParent:
                     pool = (
                         [o for o in context.selected_objects if o.type == "MESH"]
@@ -578,20 +639,19 @@ class FILE_PT_fbxBatch(Panel):
                     drawn_parents = set()
                     standalone = []
                     for obj in pool:
-                        if obj.fbxBatchExclude:
-                            continue
                         if obj.parent and obj.parent.type == "MESH":
                             if obj.parent not in drawn_parents:
                                 drawn_parents.add(obj.parent)
-                                children = [o for o in pool if o.parent == obj.parent and not o.fbxBatchExclude]
-                                self.DrawGroupRow(preview_col, obj.parent.name, children, obj.parent, props)
+                                children = [o for o in pool if o.parent == obj.parent]
+                                self.DrawParentGroupRow(preview_col, obj.parent, children, props)
                         else:
                             standalone.append(obj)
                     for obj in standalone:
                         self.DrawObjectRow(preview_col, obj, props)
                 else:
                     for fbx_name, col_name, objs, key_obj in groups:
-                        self.DrawObjectRow(preview_col, objs[0], props)
+                        for obj in objs:
+                            self.DrawObjectRow(preview_col, obj, props)
             else:
                 row = box.row()
                 row.alert = True
@@ -610,6 +670,89 @@ class FILE_PT_fbxBatch(Panel):
         )
 
 
+    # ---------- draw helpers ----------
+
+    def DrawNameGroupHeader(self, col, fbx_name, objects):
+        row = col.row(align=True)
+
+        # Group-exclude checkbox (toggles fbxBatchExclude on all members)
+        all_excluded = all(o.fbxBatchExclude for o in objects)
+        # Not excluded (i.e. active) → show CHECKBOX_HLT (checked).
+        # All excluded → show CHECKBOX_DEHLT (empty).
+        icon = "CHECKBOX_DEHLT" if all_excluded else "CHECKBOX_HLT"
+        op = row.operator("fbxbatch.toggle_group_exclude", text="", icon=icon, emboss=False)
+        op.anchor_name = objects[0].name
+
+        sub = row.row()
+        sub.active = not all_excluded
+        label = fbx_name if len(fbx_name) <= 22 else fbx_name[:20] + "…"
+        sub.label(text=label, icon="FILE_3D")
+        right = sub.row()
+        right.alignment = "RIGHT"
+        right.label(text=f"{len(objects)} meshes")
+
+
+    def DrawNameGroupChild(self, col, obj, group_objects, indent=True):
+        row = col.row(align=True)
+        if indent:
+            row.separator(factor=2.0)
+
+        excluded = obj.fbxBatchExclude
+
+        # Individual exclude checkbox
+        icon = "CHECKBOX_DEHLT" if excluded else "CHECKBOX_HLT"
+        row.prop(obj, "fbxBatchExclude", text="", icon=icon, emboss=False, invert_checkbox=True)
+
+        # Solo toggle
+        solo = obj.fbxBatchSolo
+        solo_icon = "SOLO_ON" if solo else "SOLO_OFF"
+        row.prop(obj, "fbxBatchSolo", text="", icon=solo_icon, emboss=False)
+
+        # Origin anchor (radio-button style)
+        is_origin = _IsEffectiveAnchor(obj, group_objects, "fbxBatchOriginAnchor")
+        origin_icon = "RADIOBUT_ON" if is_origin else "RADIOBUT_OFF"
+        row.prop(obj, "fbxBatchOriginAnchor", text="", icon=origin_icon, emboss=False)
+
+        # Name anchor (font/letter icon)
+        is_name = _IsEffectiveAnchor(obj, group_objects, "fbxBatchNameAnchor")
+        name_icon = "FONT_DATA" if is_name else "OUTLINER_DATA_FONT"
+        row.prop(obj, "fbxBatchNameAnchor", text="", icon=name_icon, emboss=False)
+
+        # Name label
+        sub = row.row()
+        sub.active = not excluded
+        label = obj.name if len(obj.name) <= 24 else obj.name[:22] + "…"
+        sub.label(text=label, icon="MESH_DATA")
+
+
+    def DrawParentGroupRow(self, col, parent, children, props):
+        row = col.row(align=True)
+        excluded = parent.fbxBatchExclude
+        icon = "CHECKBOX_DEHLT" if excluded else "CHECKBOX_HLT"
+        row.prop(parent, "fbxBatchExclude", text="", icon=icon, emboss=False, invert_checkbox=True)
+        sub = row.row()
+        sub.active = not excluded
+        label = parent.name if len(parent.name) <= 22 else parent.name[:20] + "…"
+        sub.label(text=label, icon="OUTLINER_OB_EMPTY")
+        right = sub.row()
+        right.alignment = "RIGHT"
+        col_name = GetMeshCollectionName(parent) if props.useCollectionFolders else None
+        if col_name:
+            right.label(text=col_name, icon="OUTLINER_COLLECTION")
+        right.label(text=f"{len(children)} meshes")
+
+        for obj in children:
+            child_row = col.row(align=True)
+            child_row.separator(factor=2.0)
+            excluded = obj.fbxBatchExclude
+            icon = "CHECKBOX_DEHLT" if excluded else "CHECKBOX_HLT"
+            child_row.prop(obj, "fbxBatchExclude", text="", icon=icon, emboss=False, invert_checkbox=True)
+            child_sub = child_row.row()
+            child_sub.active = not excluded
+            child_label = obj.name if len(obj.name) <= 24 else obj.name[:22] + "…"
+            child_sub.label(text=child_label, icon="MESH_DATA")
+
+
     def DrawObjectRow(self, col, obj, props):
         row = col.row(align=True)
         excluded = obj.fbxBatchExclude
@@ -626,47 +769,22 @@ class FILE_PT_fbxBatch(Panel):
             right.label(text=col_name, icon="OUTLINER_COLLECTION")
 
 
-    def DrawGroupRow(self, col, name, children, key_obj, props):
-        row = col.row(align=True)
-        excluded = key_obj.fbxBatchExclude
-        icon = "CHECKBOX_DEHLT" if excluded else "CHECKBOX_HLT"
-        row.prop(key_obj, "fbxBatchExclude", text="", icon=icon, emboss=False, invert_checkbox=True)
-        sub = row.row()
-        sub.active = not excluded
-        label = name if len(name) <= 22 else name[:20] + "…"
-        sub.label(text=label, icon="OUTLINER_OB_EMPTY")
-        right = sub.row()
-        right.alignment = "RIGHT"
-        col_name = GetMeshCollectionName(key_obj) if props.useCollectionFolders else None
-        if col_name:
-            right.label(text=col_name, icon="OUTLINER_COLLECTION")
-        right.label(text=f"{len(children)} meshes")
 
-
-    def DrawNameGroupRow(self, col, fbx_name, objects, props):
-        row = col.row(align=True)
-        sub = row.row()
-        label = fbx_name if len(fbx_name) <= 22 else fbx_name[:20] + "…"
-        sub.label(text=label, icon="FILE_3D")
-        right = sub.row()
-        right.alignment = "RIGHT"
-        right.label(text=f"{len(objects)} meshes")
-
-        for obj in objects:
-            child_row = col.row(align=True)
-            child_row.separator(factor=2.0)
-            excluded = obj.fbxBatchExclude
-            icon = "CHECKBOX_DEHLT" if excluded else "CHECKBOX_HLT"
-            child_row.prop(obj, "fbxBatchExclude", text="", icon=icon, emboss=False, invert_checkbox=True)
-            child_sub = child_row.row()
-            child_sub.active = not excluded
-            child_label = obj.name if len(obj.name) <= 24 else obj.name[:22] + "…"
-            child_sub.label(text=child_label, icon="MESH_DATA")
+def _IsEffectiveAnchor(obj, group_objects, attr_name):
+    if getattr(obj, attr_name, False) and not obj.fbxBatchExclude:
+        return True
+    if any(getattr(o, attr_name, False) and not o.fbxBatchExclude for o in group_objects):
+        return False
+    active = [o for o in group_objects if not o.fbxBatchExclude]
+    if not active:
+        return False
+    return AutoAnchorFrom(active) is obj
 
 
 
 registeredClasses = (
     FbxBatchProps,
+    FBXBATCH_OT_toggleGroupExclude,
     FBXBATCH_OT_export,
     FILE_PT_fbxBatch,
 )
@@ -682,12 +800,32 @@ def register():
         description="Skip this object during batch FBX export",
         default=False,
     )
+    bpy.types.Object.fbxBatchSolo = BoolProperty(
+        name="Solo (don't group)",
+        description="Export this mesh as a single FBX, ignoring name-based grouping",
+        default=False,
+    )
+    bpy.types.Object.fbxBatchOriginAnchor = BoolProperty(
+        name="Origin Anchor",
+        description="Use this object's origin as the pivot when moving the group to origin",
+        default=False,
+        update=_OriginAnchorUpdate,
+    )
+    bpy.types.Object.fbxBatchNameAnchor = BoolProperty(
+        name="Name Anchor",
+        description="Use this object's name as the FBX filename for the group",
+        default=False,
+        update=_NameAnchorUpdate,
+    )
 
 
 
 def unregister():
     del bpy.types.Scene.fbxBatchProps
     del bpy.types.Object.fbxBatchExclude
+    del bpy.types.Object.fbxBatchSolo
+    del bpy.types.Object.fbxBatchOriginAnchor
+    del bpy.types.Object.fbxBatchNameAnchor
     for cls in reversed(registeredClasses):
         bpy.utils.unregister_class(cls)
 
