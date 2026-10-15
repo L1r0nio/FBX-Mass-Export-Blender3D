@@ -1,7 +1,7 @@
 bl_info = {
     "name": "FBX Mass Export mesh",
     "author": "L1ra",
-    "version": (0, 3, 0),
+    "version": (0, 5, 5),
     "blender": (4, 3, 2),
     "location": "File > Export > FBX > Batch Export",
     "description": "Adds batch export to the native FBX export dialog",
@@ -9,12 +9,13 @@ bl_info = {
 }
 
 
-
 import bpy
 import os
+import re
 import sys
 import subprocess
-from bpy.props import BoolProperty
+from mathutils import Vector
+from bpy.props import BoolProperty, EnumProperty
 from bpy.types import Operator, Panel, PropertyGroup
 
 
@@ -27,15 +28,155 @@ def GetMeshCollectionName(obj):
 
 
 
+def TokenizeName(name):
+    return re.findall(r'[A-Za-z]+|[0-9]+', name)
+
+
+
+def BuildGroupFingerprints(tokens):
+    word_indices = [i for i, t in enumerate(tokens) if not t[0].isdigit()]
+    fingerprints = []
+    for skip_idx in word_indices:
+        fp = []
+        for i, t in enumerate(tokens):
+            if i == skip_idx:
+                fp.append("*")
+            elif t[0].isdigit():
+                fp.append(("N", t))
+            else:
+                fp.append(("W", t.lower()))
+        fingerprints.append((tuple(fp), skip_idx))
+    return fingerprints
+
+
+
+def GroupByNameSimilarity(objects):
+    if not objects:
+        return {}
+
+    token_map = {}
+    for obj in objects:
+        tokens = TokenizeName(obj.name)
+        token_map[obj] = tokens
+
+    fingerprint_buckets = {}
+
+    for obj, tokens in token_map.items():
+        fps = BuildGroupFingerprints(tokens)
+        for fp, skip_idx in fps:
+            if fp not in fingerprint_buckets:
+                fingerprint_buckets[fp] = []
+            fingerprint_buckets[fp].append((obj, skip_idx))
+
+    used = set()
+    raw_groups = []
+
+    sorted_buckets = sorted(fingerprint_buckets.items(), key=lambda x: -len(x[1]))
+
+    for fp, bucket_items in sorted_buckets:
+        group_objs = []
+        skip_positions = set()
+        for obj, skip_idx in bucket_items:
+            if id(obj) not in used:
+                group_objs.append(obj)
+                skip_positions.add(skip_idx)
+
+        if len(group_objs) >= 2:
+            for obj in group_objs:
+                used.add(id(obj))
+            raw_groups.append((group_objs, skip_positions))
+
+    for obj in objects:
+        if id(obj) not in used:
+            used.add(id(obj))
+            raw_groups.append(([obj], set()))
+
+    result = {}
+    for group_objs, skip_positions in raw_groups:
+        names = [o.name for o in group_objs]
+        fbx_name = DeriveFbxName(names, skip_positions, token_map)
+        if fbx_name in result:
+            fbx_name = fbx_name + "_" + str(len(result))
+        result[fbx_name] = group_objs
+
+    return result
+
+
+
+def DeriveFbxName(names, skip_positions, token_map=None):
+    if len(names) == 1:
+        return names[0]
+
+    if token_map:
+        first_obj = None
+        for obj, tokens in token_map.items():
+            if obj.name == names[0]:
+                first_obj = obj
+                break
+        if first_obj:
+            tokens = token_map[first_obj]
+            result_parts = []
+            for i, t in enumerate(tokens):
+                if i not in skip_positions:
+                    result_parts.append(t)
+            if result_parts:
+                return "_".join(result_parts)
+
+    return BuildFbxNameFallback(names)
+
+
+
+def BuildFbxNameFallback(names):
+    token_lists = [TokenizeName(n) for n in names]
+    if not token_lists:
+        return names[0] if names else "unnamed"
+
+    min_len = min(len(tl) for tl in token_lists)
+
+    prefix_tokens = []
+    for i in range(min_len):
+        vals = set(tl[i].lower() for tl in token_lists)
+        if len(vals) == 1:
+            prefix_tokens.append(token_lists[0][i])
+        else:
+            break
+
+    suffix_tokens = []
+    for i in range(1, min_len - len(prefix_tokens) + 1):
+        vals = set(tl[-i].lower() for tl in token_lists)
+        if len(vals) == 1:
+            suffix_tokens.insert(0, token_lists[0][-i])
+        else:
+            break
+
+    parts = []
+    if prefix_tokens:
+        parts.extend(prefix_tokens)
+    if suffix_tokens:
+        parts.extend(suffix_tokens)
+
+    return "_".join(parts) if parts else names[0]
+
+
+
 def CollectExportGroups(context, props, useSelection=False):
     if useSelection:
         pool = [o for o in context.selected_objects if o.type == "MESH"]
     else:
         pool = [o for o in context.scene.objects if o.type == "MESH"]
 
+    pool = [o for o in pool if not o.fbxBatchExclude]
+
     groups = []
 
-    if props.groupByParent:
+    if props.groupByName:
+        name_groups = GroupByNameSimilarity(pool)
+        for fbx_name, objs in name_groups.items():
+            col_name = GetMeshCollectionName(objs[0]) if props.useCollectionFolders else None
+            key_obj = objs[0]
+            groups.append((fbx_name, col_name, objs, key_obj))
+
+    elif props.groupByParent:
         parent_map = {}
         standalone = []
         for obj in pool:
@@ -53,14 +194,10 @@ def CollectExportGroups(context, props, useSelection=False):
             groups.append((parent.name, col_name, children, parent))
 
         for obj in standalone:
-            if obj.fbxBatchExclude:
-                continue
             col_name = GetMeshCollectionName(obj) if props.useCollectionFolders else None
             groups.append((obj.name, col_name, [obj], obj))
     else:
         for obj in pool:
-            if obj.fbxBatchExclude:
-                continue
             col_name = GetMeshCollectionName(obj) if props.useCollectionFolders else None
             groups.append((obj.name, col_name, [obj], obj))
 
@@ -79,6 +216,11 @@ class FbxBatchProps(PropertyGroup):
         description="Meshes that share a mesh parent are combined into one FBX named after the parent",
         default=False,
     )
+    groupByName: BoolProperty(
+        name="Group by Name",
+        description="Objects with similar names differing only in one structural word token are combined into one FBX",
+        default=False,
+    )
     openAfterExport: BoolProperty(
         name="Open Folder",
         description="Open the output folder after export finishes",
@@ -88,6 +230,24 @@ class FbxBatchProps(PropertyGroup):
         name="Preview",
         description="Show list of objects that will be exported",
         default=True,
+    )
+    moveToOrigin: BoolProperty(
+        name="Move to Origin",
+        description="Temporarily move each object or group to the world origin before export so that the FBX pivot sits at (0,0,0). Objects are returned to their original positions afterwards",
+        default=False,
+    )
+    originAnchor: EnumProperty(
+        name="Anchor",
+        description="Which point is placed at the world origin during export",
+        items=[
+            ("ORIGIN", "Object Origin",
+             "The key object's origin pivot point is moved to (0,0,0) and all group members follow"),
+            ("BBOX_CENTER", "Bounding Box Center",
+             "The center of the group's combined bounding box is moved to (0,0,0)"),
+            ("LOWEST_ORIGIN", "Lowest Origin",
+             "The origin of the object with the lowest Z among the group is moved to (0,0,0)"),
+        ],
+        default="ORIGIN",
     )
 
 
@@ -161,11 +321,117 @@ class MeshFbxBatchExporter:
         }
 
 
-    def ExportGroup(self, name, col_name, objects):
+    def ComputeAnchorObject(self, objects, key_obj):
+        mode = self.props.originAnchor
+
+        if mode == "ORIGIN":
+            return key_obj
+
+        elif mode == "LOWEST_ORIGIN":
+            self.context.view_layer.update()
+            all_objs = list(objects)
+            if key_obj not in all_objs:
+                all_objs.append(key_obj)
+            lowest = min(all_objs, key=lambda o: o.matrix_world.translation.z)
+            return lowest
+
+        elif mode == "BBOX_CENTER":
+            return None
+
+        return key_obj
+
+
+    def ComputeBBoxCenter(self, objects, key_obj):
+        self.context.view_layer.update()
+        all_objs = list(objects)
+        if key_obj not in all_objs:
+            all_objs.append(key_obj)
+        mins = Vector((float("inf"), float("inf"), float("inf")))
+        maxs = Vector((float("-inf"), float("-inf"), float("-inf")))
+        for obj in all_objs:
+            for corner in obj.bound_box:
+                world_corner = obj.matrix_world @ Vector(corner)
+                mins.x = min(mins.x, world_corner.x)
+                mins.y = min(mins.y, world_corner.y)
+                mins.z = min(mins.z, world_corner.z)
+                maxs.x = max(maxs.x, world_corner.x)
+                maxs.y = max(maxs.y, world_corner.y)
+                maxs.z = max(maxs.z, world_corner.z)
+        return (mins + maxs) / 2.0
+
+
+    def MoveGroupToOrigin(self, objects, key_obj):
+        """Move objects so the anchor ends up at world origin (0,0,0).
+        Pure transform math — no operators, no 3D view context needed."""
+        all_objs = list(objects)
+        if key_obj not in all_objs:
+            all_objs.append(key_obj)
+
+        saved_locations = {}
+        for obj in all_objs:
+            saved_locations[obj] = obj.location.copy()
+
+        self.context.view_layer.update()
+
+        mode = self.props.originAnchor
+
+        if mode == "BBOX_CENTER":
+            center = self.ComputeBBoxCenter(objects, key_obj)
+            offset = -center
+        else:
+            anchor_obj = self.ComputeAnchorObject(objects, key_obj)
+            offset = Vector((0.0, 0.0, 0.0)) - anchor_obj.matrix_world.translation
+
+        # Apply offset only to root objects within the group;
+        # children will follow their parent automatically.
+        for obj in all_objs:
+            parent_in_group = obj.parent is not None and obj.parent in all_objs
+            if parent_in_group:
+                continue
+
+            if obj.parent is not None:
+                # Convert world-space offset into parent-local space
+                parent_matrix = obj.parent.matrix_world
+                try:
+                    local_offset = parent_matrix.inverted().to_3x3() @ offset
+                except ValueError:
+                    local_offset = offset
+            else:
+                local_offset = offset
+
+            obj.location = obj.location + local_offset
+
+        self.context.view_layer.update()
+        return saved_locations
+
+
+    def RestoreAfterMove(self, saved):
+        if saved is None:
+            return
+        for obj, loc in saved.items():
+            obj.location = loc
+        self.context.view_layer.update()
+
+
+    def ExportGroup(self, name, col_name, objects, key_obj):
+        for obj in self.context.view_layer.objects:
+            obj.select_set(False)
+
         for obj in objects:
             obj.select_set(True)
         if objects:
             self.context.view_layer.objects.active = objects[0]
+
+        saved_move = None
+        if self.props.moveToOrigin:
+            saved_move = self.MoveGroupToOrigin(objects, key_obj)
+
+            for obj in self.context.view_layer.objects:
+                obj.select_set(False)
+            for obj in objects:
+                obj.select_set(True)
+            if objects:
+                self.context.view_layer.objects.active = objects[0]
 
         folder = os.path.join(self.outputDir, col_name) if col_name else self.outputDir
         os.makedirs(folder, exist_ok=True)
@@ -179,6 +445,7 @@ class MeshFbxBatchExporter:
             self.failedNames.append(name)
             print(f"  ✗  {name}  ERROR: {error}")
         finally:
+            self.RestoreAfterMove(saved_move)
             for obj in objects:
                 obj.select_set(False)
 
@@ -202,9 +469,9 @@ class MeshFbxBatchExporter:
 
         wm = self.context.window_manager
         wm.progress_begin(0, len(groups))
-        for i, (name, col_name, objects, _key) in enumerate(groups):
+        for i, (name, col_name, objects, key_obj) in enumerate(groups):
             wm.progress_update(i)
-            self.ExportGroup(name, col_name, objects)
+            self.ExportGroup(name, col_name, objects, key_obj)
         wm.progress_end()
 
         self.RestoreSelection(state)
@@ -272,8 +539,18 @@ class FILE_PT_fbxBatch(Panel):
         row.prop(props, "groupByParent", icon="OUTLINER_OB_EMPTY")
 
         row = col.row(align=True)
+        row.prop(props, "groupByName", icon="SORTALPHA")
         row.prop(props, "openAfterExport", icon="FILE_FOLDER")
+
+        row = col.row(align=True)
         row.prop(props, "showPreview", icon="HIDE_OFF" if props.showPreview else "HIDE_ON")
+
+        col.separator(factor=0.5)
+        row = col.row(align=True)
+        row.prop(props, "moveToOrigin", icon="OBJECT_ORIGIN")
+        sub = row.row(align=True)
+        sub.active = props.moveToOrigin
+        sub.prop(props, "originAnchor", text="")
 
         if props.showPreview:
             layout.separator(factor=0.3)
@@ -286,31 +563,35 @@ class FILE_PT_fbxBatch(Panel):
                 icon="MESH_DATA",
             )
 
-            pool = (
-                [o for o in context.selected_objects if o.type == "MESH"]
-                if fbxOp.use_selection
-                else [o for o in context.scene.objects if o.type == "MESH"]
-            )
+            if groups:
+                preview_col = box.column(align=True)
 
-            if pool:
-                col = box.column(align=True)
-
-                if props.groupByParent:
+                if props.groupByName:
+                    for fbx_name, col_name, objs, key_obj in groups:
+                        self.DrawNameGroupRow(preview_col, fbx_name, objs, props)
+                elif props.groupByParent:
+                    pool = (
+                        [o for o in context.selected_objects if o.type == "MESH"]
+                        if fbxOp.use_selection
+                        else [o for o in context.scene.objects if o.type == "MESH"]
+                    )
                     drawn_parents = set()
                     standalone = []
                     for obj in pool:
+                        if obj.fbxBatchExclude:
+                            continue
                         if obj.parent and obj.parent.type == "MESH":
                             if obj.parent not in drawn_parents:
                                 drawn_parents.add(obj.parent)
-                                children = [o for o in pool if o.parent == obj.parent]
-                                self.DrawGroupRow(col, obj.parent.name, children, obj.parent, props)
+                                children = [o for o in pool if o.parent == obj.parent and not o.fbxBatchExclude]
+                                self.DrawGroupRow(preview_col, obj.parent.name, children, obj.parent, props)
                         else:
                             standalone.append(obj)
                     for obj in standalone:
-                        self.DrawObjectRow(col, obj, props)
+                        self.DrawObjectRow(preview_col, obj, props)
                 else:
-                    for obj in pool:
-                        self.DrawObjectRow(col, obj, props)
+                    for fbx_name, col_name, objs, key_obj in groups:
+                        self.DrawObjectRow(preview_col, objs[0], props)
             else:
                 row = box.row()
                 row.alert = True
@@ -360,6 +641,28 @@ class FILE_PT_fbxBatch(Panel):
         if col_name:
             right.label(text=col_name, icon="OUTLINER_COLLECTION")
         right.label(text=f"{len(children)} meshes")
+
+
+    def DrawNameGroupRow(self, col, fbx_name, objects, props):
+        row = col.row(align=True)
+        sub = row.row()
+        label = fbx_name if len(fbx_name) <= 22 else fbx_name[:20] + "…"
+        sub.label(text=label, icon="FILE_3D")
+        right = sub.row()
+        right.alignment = "RIGHT"
+        right.label(text=f"{len(objects)} meshes")
+
+        for obj in objects:
+            child_row = col.row(align=True)
+            child_row.separator(factor=2.0)
+            excluded = obj.fbxBatchExclude
+            icon = "CHECKBOX_DEHLT" if excluded else "CHECKBOX_HLT"
+            child_row.prop(obj, "fbxBatchExclude", text="", icon=icon, emboss=False, invert_checkbox=True)
+            child_sub = child_row.row()
+            child_sub.active = not excluded
+            child_label = obj.name if len(obj.name) <= 24 else obj.name[:22] + "…"
+            child_sub.label(text=child_label, icon="MESH_DATA")
+
 
 
 registeredClasses = (
