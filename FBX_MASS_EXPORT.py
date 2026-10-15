@@ -1,7 +1,7 @@
 bl_info = {
     "name": "FBX Mass Export mesh",
     "author": "L1ra",
-    "version": (0, 7, 1),
+    "version": (0, 7, 2),
     "blender": (4, 3, 2),
     "location": "File > Export > FBX > Batch Export",
     "description": "Adds batch export to the native FBX export dialog",
@@ -34,17 +34,31 @@ def TokenizeName(name):
 
 
 def WordSkipMatch(tokensA, tokensB):
+    """Same token count, exactly one differing WORD token (non-digit),
+    and that token is NOT the last one.
+
+    The last token acts as a grouping key — a color suffix, an ID, an
+    LOD index. Names that differ only in their last token belong to
+    different groups (e.g. SM_Fence_1 vs SM_Fence_2, Body_Brown vs
+    Body_DarkBrown). Names that differ in one earlier word slot
+    (Body vs Beam) are considered part of the same group.
+    """
     if len(tokensA) != len(tokensB):
         return False
     diffs = [i for i, (a, b) in enumerate(zip(tokensA, tokensB)) if a.lower() != b.lower()]
     if len(diffs) != 1:
         return False
     idx = diffs[0]
+    # Difference in the last token means a different color / suffix / LOD.
+    if idx == len(tokensA) - 1:
+        return False
     return not tokensA[idx][0].isdigit()
 
 
 
 def NumericPrefixMatch(tokensA, tokensB):
+    """One token list is a strict prefix of the other, and every extra
+    token in the longer list is purely numeric (LOD suffix)."""
     if len(tokensA) == len(tokensB):
         return False
     shorter, longer = (tokensA, tokensB) if len(tokensA) < len(tokensB) else (tokensB, tokensA)
@@ -71,21 +85,68 @@ def NamesMatch(tokensA, tokensB):
 
 
 
+def DeriveGroupNameFromTokens(tokenLists, fallback):
+    """Compose the group's base name from tokens that are identical
+    across all group members. Variant slots (Body vs Beam vs Trough)
+    are dropped, so {SM_WaterTower_1_Body_Brown, SM_WaterTower_1_Beam_Brown,
+    SM_WaterTower_1_Trough_Brown} -> 'SM_WaterTower_1_Brown'."""
+    if not tokenLists:
+        return fallback
+    min_len = min(len(t) for t in tokenLists)
+    parts = []
+    for i in range(min_len):
+        vals = set(t[i].lower() for t in tokenLists)
+        if len(vals) == 1:
+            parts.append(tokenLists[0][i])
+    return "_".join(parts) if parts else fallback
+
+
+
 def AutoAnchorFrom(objs):
+    """Fallback anchor: the object with the shortest (most basic) name."""
     return min(objs, key=lambda o: (len(TokenizeName(o.name)), o.name))
 
 
 
-def GetEffectiveAnchor(objs, attr_name):
+def GetEffectiveOriginAnchor(objs):
     active = [o for o in objs if not o.fbxBatchExclude]
     if not active:
         active = list(objs)
     if not active:
         return None
     for o in active:
-        if getattr(o, attr_name, False):
+        if getattr(o, "fbxBatchOriginAnchor", False):
             return o
     return AutoAnchorFrom(active)
+
+
+
+def GetAutoNameAnchor(objs):
+    """The object (if any) whose exact name equals the derived group name.
+    Returns None if no object's name is the base name — in that case the
+    derived (constructed) name is used instead."""
+    active = [o for o in objs if not o.fbxBatchExclude] or list(objs)
+    if not active:
+        return None
+    token_lists = [TokenizeName(o.name) for o in active]
+    base = DeriveGroupNameFromTokens(token_lists, active[0].name)
+    for o in active:
+        if o.name == base:
+            return o
+    return None
+
+
+
+def GetEffectiveNameAnchor(objs):
+    active = [o for o in objs if not o.fbxBatchExclude]
+    if not active:
+        active = list(objs)
+    if not active:
+        return None
+    for o in active:
+        if getattr(o, "fbxBatchNameAnchor", False):
+            return o
+    return GetAutoNameAnchor(active)
 
 
 
@@ -183,18 +244,32 @@ def CollectExportGroups(context, props, useSelection=False):
         name_groups = GroupByNameSimilarity(groupable)
         used_names = {}
         for objs in name_groups:
-            name_anchor = GetEffectiveAnchor(objs, "fbxBatchNameAnchor")
-            origin_anchor = GetEffectiveAnchor(objs, "fbxBatchOriginAnchor")
-            if name_anchor is None or origin_anchor is None:
+            origin_anchor = GetEffectiveOriginAnchor(objs)
+            if origin_anchor is None:
                 continue
-            base = name_anchor.name
+
+            # Filename: explicit user anchor wins; otherwise derive from
+            # the common tokens shared by every object in the group.
+            explicit = None
+            for o in objs:
+                if getattr(o, "fbxBatchNameAnchor", False) and not o.fbxBatchExclude:
+                    explicit = o
+                    break
+            if explicit is not None:
+                base = explicit.name
+            else:
+                token_lists = [TokenizeName(o.name) for o in objs]
+                base = DeriveGroupNameFromTokens(token_lists, objs[0].name)
+
             if base in used_names:
                 used_names[base] += 1
                 fbx_name = f"{base}_{used_names[base]}"
             else:
                 used_names[base] = 0
                 fbx_name = base
-            col_name = GetMeshCollectionName(name_anchor) if props.useCollectionFolders else None
+
+            col_ref = explicit if explicit is not None else AutoAnchorFrom(objs)
+            col_name = GetMeshCollectionName(col_ref) if props.useCollectionFolders else None
             groups.append((fbx_name, col_name, objs, origin_anchor))
 
         for obj in solo:
@@ -675,17 +750,14 @@ class FILE_PT_fbxBatch(Panel):
     def DrawNameGroupHeader(self, col, fbx_name, objects):
         row = col.row(align=True)
 
-        # Group-exclude checkbox (toggles fbxBatchExclude on all members)
         all_excluded = all(o.fbxBatchExclude for o in objects)
-        # Not excluded (i.e. active) → show CHECKBOX_HLT (checked).
-        # All excluded → show CHECKBOX_DEHLT (empty).
         icon = "CHECKBOX_DEHLT" if all_excluded else "CHECKBOX_HLT"
         op = row.operator("fbxbatch.toggle_group_exclude", text="", icon=icon, emboss=False)
         op.anchor_name = objects[0].name
 
         sub = row.row()
         sub.active = not all_excluded
-        label = fbx_name if len(fbx_name) <= 22 else fbx_name[:20] + "…"
+        label = fbx_name if len(fbx_name) <= 30 else fbx_name[:28] + "…"
         sub.label(text=label, icon="FILE_3D")
         right = sub.row()
         right.alignment = "RIGHT"
@@ -709,13 +781,15 @@ class FILE_PT_fbxBatch(Panel):
         row.prop(obj, "fbxBatchSolo", text="", icon=solo_icon, emboss=False)
 
         # Origin anchor (radio-button style)
-        is_origin = _IsEffectiveAnchor(obj, group_objects, "fbxBatchOriginAnchor")
-        origin_icon = "RADIOBUT_ON" if is_origin else "RADIOBUT_OFF"
+        origin_anchor = GetEffectiveOriginAnchor(group_objects)
+        origin_icon = "RADIOBUT_ON" if origin_anchor is obj else "RADIOBUT_OFF"
         row.prop(obj, "fbxBatchOriginAnchor", text="", icon=origin_icon, emboss=False)
 
-        # Name anchor (font/letter icon)
-        is_name = _IsEffectiveAnchor(obj, group_objects, "fbxBatchNameAnchor")
-        name_icon = "FONT_DATA" if is_name else "OUTLINER_DATA_FONT"
+        # Name anchor (font/letter icon) — only lights up when the object's
+        # name actually is the group's derived filename, or when the user
+        # explicitly picked it.
+        name_anchor = GetEffectiveNameAnchor(group_objects)
+        name_icon = "FONT_DATA" if name_anchor is obj else "OUTLINER_DATA_FONT"
         row.prop(obj, "fbxBatchNameAnchor", text="", icon=name_icon, emboss=False)
 
         # Name label
@@ -767,18 +841,6 @@ class FILE_PT_fbxBatch(Panel):
             right = sub.row()
             right.alignment = "RIGHT"
             right.label(text=col_name, icon="OUTLINER_COLLECTION")
-
-
-
-def _IsEffectiveAnchor(obj, group_objects, attr_name):
-    if getattr(obj, attr_name, False) and not obj.fbxBatchExclude:
-        return True
-    if any(getattr(o, attr_name, False) and not o.fbxBatchExclude for o in group_objects):
-        return False
-    active = [o for o in group_objects if not o.fbxBatchExclude]
-    if not active:
-        return False
-    return AutoAnchorFrom(active) is obj
 
 
 
