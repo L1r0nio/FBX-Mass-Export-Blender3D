@@ -1,7 +1,7 @@
 bl_info = {
     "name": "FBX Mass Export mesh",
     "author": "L1ra",
-    "version": (0, 8, 1),
+    "version": (0, 8, 4),
     "blender": (4, 3, 2),
     "location": "File > Export > FBX > Batch Export",
     "description": "Adds batch export to the native FBX export dialog",
@@ -56,6 +56,35 @@ def CommonTokenCount(tokensA, tokensB):
 
 
 
+def HasStructuralMismatch(tokensA, tokensB):
+    """Проверяет, являются ли объекты разными структурными частями.
+    Запрещает объединять объекты, если у них разное количество токенов
+    и они не являются строгим префиксом друг друга (защищает Midle, Outside и т.д.)."""
+    if not tokensA or not tokensB:
+        return True
+    if tokensA[0].lower() != tokensB[0].lower():
+        return True
+    if len(tokensA) > 1 and len(tokensB) > 1:
+        if tokensA[1].lower() != tokensB[1].lower():
+            return True
+            
+    if len(tokensA) == len(tokensB):
+        # Если длины равны, но отличаются цифры (например _1 и _2), не объединяем
+        for a, b in zip(tokensA, tokensB):
+            if a.lower() != b.lower():
+                if a[0].isdigit() and b[0].isdigit():
+                    return True
+    else:
+        # Если длины разные, проверяем, является ли короткий список строгим префиксом длинного
+        shorter, longer = (tokensA, tokensB) if len(tokensA) < len(tokensB) else (tokensB, tokensA)
+        for i in range(len(shorter)):
+            if shorter[i].lower() != longer[i].lower():
+                return True
+                
+    return False
+
+
+
 def WordSkipMatch(tokensA, tokensB):
     """Same token count, exactly one differing WORD token (non-digit),
     and that token is NOT the last one."""
@@ -67,7 +96,13 @@ def WordSkipMatch(tokensA, tokensB):
     idx = diffs[0]
     if idx == len(tokensA) - 1:
         return False
-    return not tokensA[idx][0].isdigit()
+    if tokensA[idx][0].isdigit():
+        return False
+        
+    if idx == 1:
+        return False
+        
+    return True
 
 
 
@@ -100,33 +135,6 @@ def NamesMatch(tokensA, tokensB):
 
 
 
-def DeriveGroupNameFromTokens(tokenLists, fallback, strip_words_str=None):
-    """Составляет имя из токенов, которые есть у ВСЕХ участников группы.
-    Предварительно удаляет слова из списка Strip Words."""
-    if not tokenLists:
-        return fallback
-
-    cleaned_lists = [FilterTokens(t, strip_words_str) for t in tokenLists]
-    
-    common = set(t.lower() for t in cleaned_lists[0])
-    for tokens in cleaned_lists[1:]:
-        common &= set(t.lower() for t in tokens)
-        
-    if not common:
-        return fallback
-        
-    seen = set()
-    parts = []
-    for t in cleaned_lists[0]:
-        tl = t.lower()
-        if tl in common and tl not in seen:
-            parts.append(t)
-            seen.add(tl)
-            
-    return "_".join(parts) if parts else fallback
-
-
-
 def AutoAnchorFrom(objs):
     """Fallback anchor: the object with the shortest (most basic) name."""
     return min(objs, key=lambda o: (len(TokenizeName(o.name)), o.name))
@@ -146,22 +154,6 @@ def GetEffectiveOriginAnchor(objs):
 
 
 
-def GetAutoNameAnchor(objs):
-    active = [o for o in objs if not o.fbxBatchExclude] or list(objs)
-    if not active:
-        return None
-    props = getattr(bpy.context.scene, "fbxBatchProps", None)
-    strip = props.stripWords if props else ""
-    token_lists = [TokenizeName(o.name) for o in active]
-    base = DeriveGroupNameFromTokens(token_lists, active[0].name, strip)
-    for o in active:
-        o_tokens = FilterTokens(TokenizeName(o.name), strip)
-        if "_".join(o_tokens) == base or o.name == base:
-            return o
-    return None
-
-
-
 def GetEffectiveNameAnchor(objs):
     active = [o for o in objs if not o.fbxBatchExclude]
     if not active:
@@ -171,7 +163,7 @@ def GetEffectiveNameAnchor(objs):
     for o in active:
         if getattr(o, "fbxBatchNameAnchor", False):
             return o
-    return GetAutoNameAnchor(active)
+    return AutoAnchorFrom(active)
 
 
 
@@ -321,6 +313,9 @@ def ClusterByProximityAndName(objects, threshold, minCommon, aabbTolerance=0.05,
         for j in range(i + 1, n):
             b = objs[j]
 
+            if HasStructuralMismatch(tokens[a], tokens[b]):
+                continue
+
             if CommonTokenCount(tokens[a], tokens[b]) < minCommon:
                 continue
 
@@ -344,17 +339,18 @@ def _BuildGroupEntry(cluster, props, used_names):
     if origin_anchor is None:
         return None
 
-    explicit = None
-    for o in cluster:
-        if getattr(o, "fbxBatchNameAnchor", False) and not o.fbxBatchExclude:
-            explicit = o
-            break
+    # Берем имя строго от Name Anchor (или самого короткого объекта)
+    name_anchor = GetEffectiveNameAnchor(cluster)
+    if name_anchor is None:
+        name_anchor = cluster[0]
 
-    if explicit is not None:
-        base = explicit.name
-    else:
-        token_lists = [TokenizeName(o.name) for o in cluster]
-        base = DeriveGroupNameFromTokens(token_lists, cluster[0].name, props.stripWords)
+    # Извлекаем токены и удаляем ТОЛЬКО те слова, которые в словаре
+    raw_tokens = TokenizeName(name_anchor.name)
+    clean_tokens = FilterTokens(raw_tokens, props.stripWords)
+    base = "_".join(clean_tokens)
+
+    if not base:
+        base = name_anchor.name
 
     if base in used_names:
         used_names[base] += 1
@@ -363,8 +359,7 @@ def _BuildGroupEntry(cluster, props, used_names):
         used_names[base] = 0
         fbx_name = base
 
-    col_ref = explicit if explicit is not None else AutoAnchorFrom(cluster)
-    col_name = GetMeshCollectionName(col_ref) if props.useCollectionFolders else None
+    col_name = GetMeshCollectionName(name_anchor) if props.useCollectionFolders else None
     return (fbx_name, col_name, cluster, origin_anchor)
 
 
