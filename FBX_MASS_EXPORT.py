@@ -1,7 +1,7 @@
 bl_info = {
     "name": "FBX Mass Export mesh",
     "author": "L1ra",
-    "version": (0, 7, 2),
+    "version": (0, 8, 1),
     "blender": (4, 3, 2),
     "location": "File > Export > FBX > Batch Export",
     "description": "Adds batch export to the native FBX export dialog",
@@ -15,7 +15,9 @@ import re
 import sys
 import subprocess
 from mathutils import Vector
-from bpy.props import BoolProperty, EnumProperty, StringProperty
+from bpy.props import (
+    BoolProperty, EnumProperty, StringProperty, FloatProperty, IntProperty
+)
 from bpy.types import Operator, Panel, PropertyGroup
 
 
@@ -33,23 +35,36 @@ def TokenizeName(name):
 
 
 
+def FilterTokens(tokens, strip_words_str):
+    """Удаляет указанные пользователем слова (например, Body, Windows),
+    чтобы они не влияли на сравнение и итоговое имя файла."""
+    if not strip_words_str:
+        return tokens
+    strip_set = {w.strip().lower() for w in strip_words_str.split(",") if w.strip()}
+    if not strip_set:
+        return tokens
+    filtered = [t for t in tokens if t.lower() not in strip_set]
+    # Если удалили всё, возвращаем оригинал (чтобы имя не было пустым)
+    return filtered if filtered else tokens
+
+
+
+def CommonTokenCount(tokensA, tokensB):
+    setA = set(t.lower() for t in tokensA)
+    setB = set(t.lower() for t in tokensB)
+    return len(setA & setB)
+
+
+
 def WordSkipMatch(tokensA, tokensB):
     """Same token count, exactly one differing WORD token (non-digit),
-    and that token is NOT the last one.
-
-    The last token acts as a grouping key — a color suffix, an ID, an
-    LOD index. Names that differ only in their last token belong to
-    different groups (e.g. SM_Fence_1 vs SM_Fence_2, Body_Brown vs
-    Body_DarkBrown). Names that differ in one earlier word slot
-    (Body vs Beam) are considered part of the same group.
-    """
+    and that token is NOT the last one."""
     if len(tokensA) != len(tokensB):
         return False
     diffs = [i for i, (a, b) in enumerate(zip(tokensA, tokensB)) if a.lower() != b.lower()]
     if len(diffs) != 1:
         return False
     idx = diffs[0]
-    # Difference in the last token means a different color / suffix / LOD.
     if idx == len(tokensA) - 1:
         return False
     return not tokensA[idx][0].isdigit()
@@ -85,19 +100,29 @@ def NamesMatch(tokensA, tokensB):
 
 
 
-def DeriveGroupNameFromTokens(tokenLists, fallback):
-    """Compose the group's base name from tokens that are identical
-    across all group members. Variant slots (Body vs Beam vs Trough)
-    are dropped, so {SM_WaterTower_1_Body_Brown, SM_WaterTower_1_Beam_Brown,
-    SM_WaterTower_1_Trough_Brown} -> 'SM_WaterTower_1_Brown'."""
+def DeriveGroupNameFromTokens(tokenLists, fallback, strip_words_str=None):
+    """Составляет имя из токенов, которые есть у ВСЕХ участников группы.
+    Предварительно удаляет слова из списка Strip Words."""
     if not tokenLists:
         return fallback
-    min_len = min(len(t) for t in tokenLists)
+
+    cleaned_lists = [FilterTokens(t, strip_words_str) for t in tokenLists]
+    
+    common = set(t.lower() for t in cleaned_lists[0])
+    for tokens in cleaned_lists[1:]:
+        common &= set(t.lower() for t in tokens)
+        
+    if not common:
+        return fallback
+        
+    seen = set()
     parts = []
-    for i in range(min_len):
-        vals = set(t[i].lower() for t in tokenLists)
-        if len(vals) == 1:
-            parts.append(tokenLists[0][i])
+    for t in cleaned_lists[0]:
+        tl = t.lower()
+        if tl in common and tl not in seen:
+            parts.append(t)
+            seen.add(tl)
+            
     return "_".join(parts) if parts else fallback
 
 
@@ -122,16 +147,16 @@ def GetEffectiveOriginAnchor(objs):
 
 
 def GetAutoNameAnchor(objs):
-    """The object (if any) whose exact name equals the derived group name.
-    Returns None if no object's name is the base name — in that case the
-    derived (constructed) name is used instead."""
     active = [o for o in objs if not o.fbxBatchExclude] or list(objs)
     if not active:
         return None
+    props = getattr(bpy.context.scene, "fbxBatchProps", None)
+    strip = props.stripWords if props else ""
     token_lists = [TokenizeName(o.name) for o in active]
-    base = DeriveGroupNameFromTokens(token_lists, active[0].name)
+    base = DeriveGroupNameFromTokens(token_lists, active[0].name, strip)
     for o in active:
-        if o.name == base:
+        o_tokens = FilterTokens(TokenizeName(o.name), strip)
+        if "_".join(o_tokens) == base or o.name == base:
             return o
     return None
 
@@ -156,8 +181,10 @@ def _OriginAnchorUpdate(self, context):
     scene = getattr(context, "scene", None)
     if scene is None:
         return
+    props = getattr(scene, "fbxBatchProps", None)
+    strip = props.stripWords if props else ""
     try:
-        this_tokens = TokenizeName(self.name)
+        this_tokens = FilterTokens(TokenizeName(self.name), strip)
     except Exception:
         return
     for obj in scene.objects:
@@ -165,7 +192,7 @@ def _OriginAnchorUpdate(self, context):
             continue
         if getattr(obj, "fbxBatchOriginAnchor", False):
             try:
-                if NamesMatch(this_tokens, TokenizeName(obj.name)):
+                if NamesMatch(this_tokens, FilterTokens(TokenizeName(obj.name), strip)):
                     obj.fbxBatchOriginAnchor = False
             except Exception:
                 pass
@@ -178,8 +205,10 @@ def _NameAnchorUpdate(self, context):
     scene = getattr(context, "scene", None)
     if scene is None:
         return
+    props = getattr(scene, "fbxBatchProps", None)
+    strip = props.stripWords if props else ""
     try:
-        this_tokens = TokenizeName(self.name)
+        this_tokens = FilterTokens(TokenizeName(self.name), strip)
     except Exception:
         return
     for obj in scene.objects:
@@ -187,18 +216,18 @@ def _NameAnchorUpdate(self, context):
             continue
         if getattr(obj, "fbxBatchNameAnchor", False):
             try:
-                if NamesMatch(this_tokens, TokenizeName(obj.name)):
+                if NamesMatch(this_tokens, FilterTokens(TokenizeName(obj.name), strip)):
                     obj.fbxBatchNameAnchor = False
             except Exception:
                 pass
 
 
 
-def GroupByNameSimilarity(objects):
+def GroupByNameSimilarity(objects, strip_words_str=None):
     if not objects:
         return []
 
-    tokenMap = {obj: TokenizeName(obj.name) for obj in objects}
+    tokenMap = {obj: FilterTokens(TokenizeName(obj.name), strip_words_str) for obj in objects}
     parent = {id(obj): id(obj) for obj in objects}
 
     def Find(x):
@@ -229,6 +258,117 @@ def GroupByNameSimilarity(objects):
 
 
 
+# ---------- proximity clustering ----------
+
+def ComputeWorldAABB(obj):
+    corners = [obj.matrix_world @ Vector(c) for c in obj.bound_box]
+    min_v = Vector((
+        min(c.x for c in corners),
+        min(c.y for c in corners),
+        min(c.z for c in corners),
+    ))
+    max_v = Vector((
+        max(c.x for c in corners),
+        max(c.y for c in corners),
+        max(c.z for c in corners),
+    ))
+    return min_v, max_v
+
+
+
+def AABBsOverlap(aabb_a, aabb_b, tolerance):
+    min_a, max_a = aabb_a
+    min_b, max_b = aabb_b
+    return (
+        min_a.x <= max_b.x + tolerance and max_a.x >= min_b.x - tolerance and
+        min_a.y <= max_b.y + tolerance and max_a.y >= min_b.y - tolerance and
+        min_a.z <= max_b.z + tolerance and max_a.z >= min_b.z - tolerance
+    )
+
+
+
+def ClusterByProximityAndName(objects, threshold, minCommon, aabbTolerance=0.05, strip_words_str=None):
+    if not objects:
+        return []
+
+    parent = {id(obj): id(obj) for obj in objects}
+
+    def Find(x):
+        root = x
+        while parent[root] != root:
+            root = parent[root]
+        while parent[x] != root:
+            parent[x], x = root, parent[x]
+        return root
+
+    def Union(a, b):
+        ra, rb = Find(a), Find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    tokens = {}
+    origins = {}
+    aabbs = {}
+    for obj in objects:
+        tokens[obj] = FilterTokens(TokenizeName(obj.name), strip_words_str)
+        origins[obj] = obj.matrix_world.translation.copy()
+        aabbs[obj] = ComputeWorldAABB(obj)
+
+    objs = list(objects)
+    n = len(objs)
+    for i in range(n):
+        a = objs[i]
+        for j in range(i + 1, n):
+            b = objs[j]
+
+            if CommonTokenCount(tokens[a], tokens[b]) < minCommon:
+                continue
+
+            if (origins[a] - origins[b]).length <= threshold:
+                Union(id(a), id(b))
+                continue
+
+            if AABBsOverlap(aabbs[a], aabbs[b], aabbTolerance):
+                Union(id(a), id(b))
+
+    groupsByRoot = {}
+    for obj in objects:
+        groupsByRoot.setdefault(Find(id(obj)), []).append(obj)
+
+    return list(groupsByRoot.values())
+
+
+
+def _BuildGroupEntry(cluster, props, used_names):
+    origin_anchor = GetEffectiveOriginAnchor(cluster)
+    if origin_anchor is None:
+        return None
+
+    explicit = None
+    for o in cluster:
+        if getattr(o, "fbxBatchNameAnchor", False) and not o.fbxBatchExclude:
+            explicit = o
+            break
+
+    if explicit is not None:
+        base = explicit.name
+    else:
+        token_lists = [TokenizeName(o.name) for o in cluster]
+        base = DeriveGroupNameFromTokens(token_lists, cluster[0].name, props.stripWords)
+
+    if base in used_names:
+        used_names[base] += 1
+        fbx_name = f"{base}_{used_names[base]}"
+    else:
+        used_names[base] = 0
+        fbx_name = base
+
+    col_ref = explicit if explicit is not None else AutoAnchorFrom(cluster)
+    col_name = GetMeshCollectionName(col_ref) if props.useCollectionFolders else None
+    return (fbx_name, col_name, cluster, origin_anchor)
+
+
+
 def CollectExportGroups(context, props, useSelection=False):
     if useSelection:
         pool = [o for o in context.selected_objects if o.type == "MESH"]
@@ -237,40 +377,35 @@ def CollectExportGroups(context, props, useSelection=False):
 
     groups = []
 
-    if props.groupByName:
+    if props.groupByProximity:
         solo = [o for o in pool if o.fbxBatchSolo]
         groupable = [o for o in pool if not o.fbxBatchSolo]
 
-        name_groups = GroupByNameSimilarity(groupable)
+        clusters = ClusterByProximityAndName(
+            groupable, props.proximityThreshold, props.minCommonTokens, 
+            strip_words_str=props.stripWords
+        )
+
+        used_names = {}
+        for cluster in clusters:
+            entry = _BuildGroupEntry(cluster, props, used_names)
+            if entry is not None:
+                groups.append(entry)
+
+        for obj in solo:
+            col_name = GetMeshCollectionName(obj) if props.useCollectionFolders else None
+            groups.append((obj.name, col_name, [obj], obj))
+
+    elif props.groupByName:
+        solo = [o for o in pool if o.fbxBatchSolo]
+        groupable = [o for o in pool if not o.fbxBatchSolo]
+
+        name_groups = GroupByNameSimilarity(groupable, strip_words_str=props.stripWords)
         used_names = {}
         for objs in name_groups:
-            origin_anchor = GetEffectiveOriginAnchor(objs)
-            if origin_anchor is None:
-                continue
-
-            # Filename: explicit user anchor wins; otherwise derive from
-            # the common tokens shared by every object in the group.
-            explicit = None
-            for o in objs:
-                if getattr(o, "fbxBatchNameAnchor", False) and not o.fbxBatchExclude:
-                    explicit = o
-                    break
-            if explicit is not None:
-                base = explicit.name
-            else:
-                token_lists = [TokenizeName(o.name) for o in objs]
-                base = DeriveGroupNameFromTokens(token_lists, objs[0].name)
-
-            if base in used_names:
-                used_names[base] += 1
-                fbx_name = f"{base}_{used_names[base]}"
-            else:
-                used_names[base] = 0
-                fbx_name = base
-
-            col_ref = explicit if explicit is not None else AutoAnchorFrom(objs)
-            col_name = GetMeshCollectionName(col_ref) if props.useCollectionFolders else None
-            groups.append((fbx_name, col_name, objs, origin_anchor))
+            entry = _BuildGroupEntry(objs, props, used_names)
+            if entry is not None:
+                groups.append(entry)
 
         for obj in solo:
             col_name = GetMeshCollectionName(obj) if props.useCollectionFolders else None
@@ -316,8 +451,39 @@ class FbxBatchProps(PropertyGroup):
     )
     groupByName: BoolProperty(
         name="Group by Name",
-        description="Objects with similar names differing only in one structural word token are combined into one FBX",
+        description="Objects with similar names are combined into one FBX. "
+                    "Differs from Proximity mode in that spatial position is ignored",
         default=False,
+    )
+    groupByProximity: BoolProperty(
+        name="Group by Proximity",
+        description="Objects that are close together in 3D space AND share a common "
+                    "name prefix are combined into one FBX. Takes precedence over "
+                    "Group by Name and Group by Parent",
+        default=False,
+    )
+    stripWords: StringProperty(
+        name="Strip Words",
+        description="Список слов через запятую, которые нужно игнорировать при составлении имени "
+                    "и при сравнении объектов. Например: Body, Windows, Inside, Outside",
+        default="Body, Windows, Inside, Outside",
+    )
+    proximityThreshold: FloatProperty(
+        name="Threshold",
+        description="Max distance between object origins to be considered part of "
+                    "the same group (AABB overlap is also accepted)",
+        default=0.1,
+        min=0.0001,
+        soft_max=10.0,
+        unit="LENGTH",
+    )
+    minCommonTokens: IntProperty(
+        name="Common Words",
+        description="Minimum number of shared name tokens two objects need to be "
+                    "clustered by proximity.",
+        default=3,
+        min=1,
+        max=10,
     )
     openAfterExport: BoolProperty(
         name="Open Folder",
@@ -331,7 +497,9 @@ class FbxBatchProps(PropertyGroup):
     )
     moveToOrigin: BoolProperty(
         name="Move to Origin",
-        description="Temporarily move each object or group to the world origin before export so that the FBX pivot sits at (0,0,0). Objects are returned to their original positions afterwards",
+        description="Temporarily move each object or group to the world origin before "
+                    "export so that the FBX pivot sits at (0,0,0). Objects are "
+                    "returned to their original positions afterwards",
         default=False,
     )
     originAnchor: EnumProperty(
@@ -356,19 +524,25 @@ class FBXBATCH_OT_toggleGroupExclude(Operator):
     bl_options = {"INTERNAL"}
 
     anchor_name: StringProperty()
+    object_names: StringProperty()
 
     def execute(self, context):
-        anchor = context.scene.objects.get(self.anchor_name)
-        if anchor is None or anchor.type != "MESH":
-            return {"CANCELLED"}
+        if self.object_names:
+            names = set(self.object_names.split("\n"))
+            group = [o for o in context.scene.objects if o.name in names and o.type == "MESH"]
+        else:
+            anchor = context.scene.objects.get(self.anchor_name)
+            if anchor is None or anchor.type != "MESH":
+                return {"CANCELLED"}
+            props = context.scene.fbxBatchProps
+            tokens = FilterTokens(TokenizeName(anchor.name), props.stripWords)
+            group = [
+                o for o in context.scene.objects
+                if o.type == "MESH"
+                and not o.fbxBatchSolo
+                and NamesMatch(tokens, FilterTokens(TokenizeName(o.name), props.stripWords))
+            ]
 
-        tokens = TokenizeName(anchor.name)
-        group = [
-            o for o in context.scene.objects
-            if o.type == "MESH"
-            and not o.fbxBatchSolo
-            and NamesMatch(tokens, TokenizeName(o.name))
-        ]
         if not group:
             return {"CANCELLED"}
 
@@ -583,6 +757,7 @@ class MeshFbxBatchExporter:
 
 
     def Run(self):
+        self.context.view_layer.update()
         raw_groups = CollectExportGroups(self.context, self.props, self.fbxOp.use_selection)
 
         groups = []
@@ -673,9 +848,18 @@ class FILE_PT_fbxBatch(Panel):
 
         row = col.row(align=True)
         row.prop(props, "groupByName", icon="SORTALPHA")
-        row.prop(props, "openAfterExport", icon="FILE_FOLDER")
+        row.prop(props, "groupByProximity", icon="SNAP_ON")
+
+        if props.groupByProximity:
+            sub = col.row(align=True)
+            sub.prop(props, "proximityThreshold")
+            sub.prop(props, "minCommonTokens")
+
+        if props.groupByName or props.groupByProximity:
+            col.prop(props, "stripWords")
 
         row = col.row(align=True)
+        row.prop(props, "openAfterExport", icon="FILE_FOLDER")
         row.prop(props, "showPreview", icon="HIDE_OFF" if props.showPreview else "HIDE_ON")
 
         col.separator(factor=0.5)
@@ -699,7 +883,7 @@ class FILE_PT_fbxBatch(Panel):
             if groups:
                 preview_col = box.column(align=True)
 
-                if props.groupByName:
+                if props.groupByProximity or props.groupByName:
                     for fbx_name, col_name, objs, key_obj in groups:
                         if len(objs) >= 2:
                             self.DrawNameGroupHeader(preview_col, fbx_name, objs)
@@ -754,6 +938,7 @@ class FILE_PT_fbxBatch(Panel):
         icon = "CHECKBOX_DEHLT" if all_excluded else "CHECKBOX_HLT"
         op = row.operator("fbxbatch.toggle_group_exclude", text="", icon=icon, emboss=False)
         op.anchor_name = objects[0].name
+        op.object_names = "\n".join(o.name for o in objects)
 
         sub = row.row()
         sub.active = not all_excluded
@@ -771,28 +956,21 @@ class FILE_PT_fbxBatch(Panel):
 
         excluded = obj.fbxBatchExclude
 
-        # Individual exclude checkbox
         icon = "CHECKBOX_DEHLT" if excluded else "CHECKBOX_HLT"
         row.prop(obj, "fbxBatchExclude", text="", icon=icon, emboss=False, invert_checkbox=True)
 
-        # Solo toggle
         solo = obj.fbxBatchSolo
         solo_icon = "SOLO_ON" if solo else "SOLO_OFF"
         row.prop(obj, "fbxBatchSolo", text="", icon=solo_icon, emboss=False)
 
-        # Origin anchor (radio-button style)
         origin_anchor = GetEffectiveOriginAnchor(group_objects)
         origin_icon = "RADIOBUT_ON" if origin_anchor is obj else "RADIOBUT_OFF"
         row.prop(obj, "fbxBatchOriginAnchor", text="", icon=origin_icon, emboss=False)
 
-        # Name anchor (font/letter icon) — only lights up when the object's
-        # name actually is the group's derived filename, or when the user
-        # explicitly picked it.
         name_anchor = GetEffectiveNameAnchor(group_objects)
         name_icon = "FONT_DATA" if name_anchor is obj else "OUTLINER_DATA_FONT"
         row.prop(obj, "fbxBatchNameAnchor", text="", icon=name_icon, emboss=False)
 
-        # Name label
         sub = row.row()
         sub.active = not excluded
         label = obj.name if len(obj.name) <= 24 else obj.name[:22] + "…"
