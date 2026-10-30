@@ -1,7 +1,7 @@
 bl_info = {
     "name": "FBX Mass Export mesh",
     "author": "L1ra",
-    "version": (0, 8, 4),
+    "version": (0, 8, 6),
     "blender": (4, 3, 2),
     "location": "File > Export > FBX > Batch Export",
     "description": "Adds batch export to the native FBX export dialog",
@@ -30,21 +30,98 @@ def GetMeshCollectionName(obj):
 
 
 
+def CleanCollectionFolderName(name, strip_words_str):
+    strip_set = {w.strip().lower() for w in strip_words_str.split(",") if w.strip()}
+
+    if strip_set:
+        tokens = re.findall(r"[^\W\d_]+|\d+", name, flags=re.UNICODE)
+        name = "_".join(t for t in tokens if t.lower() not in strip_set)
+
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name)
+    name = name.strip().rstrip(" .")
+
+    if not name:
+        name = "Collection"
+
+    reserved = {"CON", "PRN", "AUX", "NUL"}
+    reserved.update(f"COM{i}" for i in range(1, 10))
+    reserved.update(f"LPT{i}" for i in range(1, 10))
+
+    if name.split(".", 1)[0].upper() in reserved:
+        name = "_" + name
+
+    return name
+
+
+
+def BuildCollectionFolderPaths(scene, strip_words_str):
+    folder_paths = {}
+
+    def Walk(parent, parent_path):
+        used_names = set()
+        children = sorted(parent.children, key=lambda c: (c.name.casefold(), c.name))
+
+        for col in children:
+            col_key = col.as_pointer()
+
+            if col_key in folder_paths:
+                continue
+
+            base = CleanCollectionFolderName(col.name, strip_words_str)
+            folder_name = base
+            suffix = 1
+
+            while folder_name.casefold() in used_names:
+                folder_name = f"{base}_{suffix}"
+                suffix += 1
+
+            used_names.add(folder_name.casefold())
+            path_parts = parent_path + (folder_name,)
+            folder_paths[col_key] = path_parts
+
+            Walk(col, path_parts)
+
+    Walk(scene.collection, ())
+    return folder_paths
+
+
+
+def GetObjectExportFolder(obj, folder_paths):
+    candidates = []
+
+    for col in obj.users_collection:
+        path_parts = folder_paths.get(col.as_pointer())
+        if path_parts is not None:
+            candidates.append(path_parts)
+
+    if not candidates:
+        return None
+
+    path_parts = min(
+        candidates,
+        key=lambda parts: (
+            -len(parts),
+            tuple(part.casefold() for part in parts),
+            parts,
+        ),
+    )
+
+    return os.path.join(*path_parts)
+
+
+
 def TokenizeName(name):
     return re.findall(r'[A-Za-z]+|[0-9]+', name)
 
 
 
 def FilterTokens(tokens, strip_words_str):
-    """Удаляет указанные пользователем слова (например, Body, Windows),
-    чтобы они не влияли на сравнение и итоговое имя файла."""
     if not strip_words_str:
         return tokens
     strip_set = {w.strip().lower() for w in strip_words_str.split(",") if w.strip()}
     if not strip_set:
         return tokens
     filtered = [t for t in tokens if t.lower() not in strip_set]
-    # Если удалили всё, возвращаем оригинал (чтобы имя не было пустым)
     return filtered if filtered else tokens
 
 
@@ -57,9 +134,6 @@ def CommonTokenCount(tokensA, tokensB):
 
 
 def HasStructuralMismatch(tokensA, tokensB):
-    """Проверяет, являются ли объекты разными структурными частями.
-    Запрещает объединять объекты, если у них разное количество токенов
-    и они не являются строгим префиксом друг друга (защищает Midle, Outside и т.д.)."""
     if not tokensA or not tokensB:
         return True
     if tokensA[0].lower() != tokensB[0].lower():
@@ -67,27 +141,23 @@ def HasStructuralMismatch(tokensA, tokensB):
     if len(tokensA) > 1 and len(tokensB) > 1:
         if tokensA[1].lower() != tokensB[1].lower():
             return True
-            
+
     if len(tokensA) == len(tokensB):
-        # Если длины равны, но отличаются цифры (например _1 и _2), не объединяем
         for a, b in zip(tokensA, tokensB):
             if a.lower() != b.lower():
                 if a[0].isdigit() and b[0].isdigit():
                     return True
     else:
-        # Если длины разные, проверяем, является ли короткий список строгим префиксом длинного
         shorter, longer = (tokensA, tokensB) if len(tokensA) < len(tokensB) else (tokensB, tokensA)
         for i in range(len(shorter)):
             if shorter[i].lower() != longer[i].lower():
                 return True
-                
+
     return False
 
 
 
 def WordSkipMatch(tokensA, tokensB):
-    """Same token count, exactly one differing WORD token (non-digit),
-    and that token is NOT the last one."""
     if len(tokensA) != len(tokensB):
         return False
     diffs = [i for i, (a, b) in enumerate(zip(tokensA, tokensB)) if a.lower() != b.lower()]
@@ -98,17 +168,15 @@ def WordSkipMatch(tokensA, tokensB):
         return False
     if tokensA[idx][0].isdigit():
         return False
-        
+
     if idx == 1:
         return False
-        
+
     return True
 
 
 
 def NumericPrefixMatch(tokensA, tokensB):
-    """One token list is a strict prefix of the other, and every extra
-    token in the longer list is purely numeric (LOD suffix)."""
     if len(tokensA) == len(tokensB):
         return False
     shorter, longer = (tokensA, tokensB) if len(tokensA) < len(tokensB) else (tokensB, tokensA)
@@ -136,7 +204,6 @@ def NamesMatch(tokensA, tokensB):
 
 
 def AutoAnchorFrom(objs):
-    """Fallback anchor: the object with the shortest (most basic) name."""
     return min(objs, key=lambda o: (len(TokenizeName(o.name)), o.name))
 
 
@@ -250,8 +317,6 @@ def GroupByNameSimilarity(objects, strip_words_str=None):
 
 
 
-# ---------- proximity clustering ----------
-
 def ComputeWorldAABB(obj):
     corners = [obj.matrix_world @ Vector(c) for c in obj.bound_box]
     min_v = Vector((
@@ -308,10 +373,18 @@ def ClusterByProximityAndName(objects, threshold, minCommon, aabbTolerance=0.05,
 
     objs = list(objects)
     n = len(objs)
+    exact_origin_eps = 0.001
+
     for i in range(n):
         a = objs[i]
         for j in range(i + 1, n):
             b = objs[j]
+
+            dist = (origins[a] - origins[b]).length
+
+            if dist < exact_origin_eps:
+                Union(id(a), id(b))
+                continue
 
             if HasStructuralMismatch(tokens[a], tokens[b]):
                 continue
@@ -319,11 +392,7 @@ def ClusterByProximityAndName(objects, threshold, minCommon, aabbTolerance=0.05,
             if CommonTokenCount(tokens[a], tokens[b]) < minCommon:
                 continue
 
-            if (origins[a] - origins[b]).length <= threshold:
-                Union(id(a), id(b))
-                continue
-
-            if AABBsOverlap(aabbs[a], aabbs[b], aabbTolerance):
+            if AABBsOverlap(aabbs[a], aabbs[b], aabbTolerance) or dist <= threshold:
                 Union(id(a), id(b))
 
     groupsByRoot = {}
@@ -339,12 +408,10 @@ def _BuildGroupEntry(cluster, props, used_names):
     if origin_anchor is None:
         return None
 
-    # Берем имя строго от Name Anchor (или самого короткого объекта)
     name_anchor = GetEffectiveNameAnchor(cluster)
     if name_anchor is None:
         name_anchor = cluster[0]
 
-    # Извлекаем токены и удаляем ТОЛЬКО те слова, которые в словаре
     raw_tokens = TokenizeName(name_anchor.name)
     clean_tokens = FilterTokens(raw_tokens, props.stripWords)
     base = "_".join(clean_tokens)
@@ -370,64 +437,64 @@ def CollectExportGroups(context, props, useSelection=False):
     else:
         pool = [o for o in context.scene.objects if o.type == "MESH"]
 
+    buckets = {}
+
+    if props.useCollectionFolders:
+        folder_paths = BuildCollectionFolderPaths(context.scene, props.folderStripWords)
+
+        for obj in pool:
+            col_name = GetObjectExportFolder(obj, folder_paths)
+            buckets.setdefault(col_name, []).append(obj)
+    else:
+        buckets[None] = pool
+
     groups = []
 
-    if props.groupByProximity:
-        solo = [o for o in pool if o.fbxBatchSolo]
-        groupable = [o for o in pool if not o.fbxBatchSolo]
-
-        clusters = ClusterByProximityAndName(
-            groupable, props.proximityThreshold, props.minCommonTokens, 
-            strip_words_str=props.stripWords
-        )
-
+    for col_name, objects in buckets.items():
         used_names = {}
-        for cluster in clusters:
-            entry = _BuildGroupEntry(cluster, props, used_names)
-            if entry is not None:
-                groups.append(entry)
 
-        for obj in solo:
-            col_name = GetMeshCollectionName(obj) if props.useCollectionFolders else None
-            groups.append((obj.name, col_name, [obj], obj))
+        if props.groupByProximity or props.groupByName:
+            solo = [o for o in objects if o.fbxBatchSolo]
+            groupable = [o for o in objects if not o.fbxBatchSolo]
 
-    elif props.groupByName:
-        solo = [o for o in pool if o.fbxBatchSolo]
-        groupable = [o for o in pool if not o.fbxBatchSolo]
-
-        name_groups = GroupByNameSimilarity(groupable, strip_words_str=props.stripWords)
-        used_names = {}
-        for objs in name_groups:
-            entry = _BuildGroupEntry(objs, props, used_names)
-            if entry is not None:
-                groups.append(entry)
-
-        for obj in solo:
-            col_name = GetMeshCollectionName(obj) if props.useCollectionFolders else None
-            groups.append((obj.name, col_name, [obj], obj))
-
-    elif props.groupByParent:
-        parent_map = {}
-        standalone = []
-        for obj in pool:
-            if obj.parent and obj.parent.type == "MESH":
-                parent_map.setdefault(obj.parent, []).append(obj)
+            if props.groupByProximity:
+                clusters = ClusterByProximityAndName(
+                    groupable, props.proximityThreshold, props.minCommonTokens,
+                    strip_words_str=props.stripWords
+                )
             else:
-                standalone.append(obj)
+                clusters = GroupByNameSimilarity(groupable, strip_words_str=props.stripWords)
 
-        for parent, children in parent_map.items():
-            if parent.fbxBatchExclude:
-                continue
-            col_name = GetMeshCollectionName(parent) if props.useCollectionFolders else None
-            groups.append((parent.name, col_name, children, parent))
+            for cluster in clusters:
+                entry = _BuildGroupEntry(cluster, props, used_names)
+                if entry is not None:
+                    fbx_name, _, objs, origin_anchor = entry
+                    groups.append((fbx_name, col_name, objs, origin_anchor))
 
-        for obj in standalone:
-            col_name = GetMeshCollectionName(obj) if props.useCollectionFolders else None
-            groups.append((obj.name, col_name, [obj], obj))
-    else:
-        for obj in pool:
-            col_name = GetMeshCollectionName(obj) if props.useCollectionFolders else None
-            groups.append((obj.name, col_name, [obj], obj))
+            for obj in solo:
+                groups.append((obj.name, col_name, [obj], obj))
+
+        elif props.groupByParent:
+            parent_map = {}
+            standalone = []
+
+            for obj in objects:
+                if obj.parent and obj.parent.type == "MESH":
+                    parent_map.setdefault(obj.parent, []).append(obj)
+                else:
+                    standalone.append(obj)
+
+            for parent, children in parent_map.items():
+                if parent.fbxBatchExclude:
+                    continue
+                groups.append((parent.name, col_name, children, parent))
+
+            for obj in standalone:
+                groups.append((obj.name, col_name, [obj], obj))
+
+        else:
+            for obj in objects:
+                groups.append((obj.name, col_name, [obj], obj))
 
     return groups
 
@@ -436,7 +503,7 @@ def CollectExportGroups(context, props, useSelection=False):
 class FbxBatchProps(PropertyGroup):
     useCollectionFolders: BoolProperty(
         name="By Collection",
-        description="Export each mesh into a subfolder named after its collection",
+        description="Export meshes into folders matching the collection hierarchy",
         default=False,
     )
     groupByParent: BoolProperty(
@@ -462,6 +529,12 @@ class FbxBatchProps(PropertyGroup):
         description="Список слов через запятую, которые нужно игнорировать при составлении имени "
                     "и при сравнении объектов. Например: Body, Windows, Inside, Outside",
         default="Body, Windows, Inside, Outside",
+    )
+    folderStripWords: StringProperty(
+        name="Folder Strip Words",
+        description="Список слов через запятую, которые нужно удалять из названий папок "
+                    "и подпапок коллекций. Не влияет на имена FBX и сравнение объектов",
+        default="",
     )
     proximityThreshold: FloatProperty(
         name="Threshold",
@@ -853,6 +926,9 @@ class FILE_PT_fbxBatch(Panel):
         if props.groupByName or props.groupByProximity:
             col.prop(props, "stripWords")
 
+        if props.useCollectionFolders:
+            col.prop(props, "folderStripWords")
+
         row = col.row(align=True)
         row.prop(props, "openAfterExport", icon="FILE_FOLDER")
         row.prop(props, "showPreview", icon="HIDE_OFF" if props.showPreview else "HIDE_ON")
@@ -923,8 +999,6 @@ class FILE_PT_fbxBatch(Panel):
             icon="EXPORT",
         )
 
-
-    # ---------- draw helpers ----------
 
     def DrawNameGroupHeader(self, col, fbx_name, objects):
         row = col.row(align=True)
